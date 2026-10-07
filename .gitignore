@@ -1,0 +1,9 @@
+# Build artifacts - Windows (PB compiler output)
+*.exe
+
+# Build artifacts - Linux (PB ELF output has no extension)
+samples/hpdf_smoke
+samples/probe_noembed
+
+# Runtime output of the samples (regenerated on every run)
+samples/*.pdf
