@@ -11,8 +11,9 @@ if (publicStart < 0 || privateStart <= publicStart || end <= privateStart) {
   throw new Error('hpdf.pbi layout changed; review the module generator before regenerating.');
 }
 const diagnostics = [
-  'Global HaruBound.i    ; functions successfully bound by HaruInit()',
-  'Global HaruMissing$   ; functions that failed to bind ("" = all bound)',
+  'Global HaruBound.i    ; functions successfully bound by HaruInit() (diagnostic of the last attempt)',
+  'Global HaruMissing$   ; functions that failed to bind ("" = all bound; diagnostic of the last attempt)',
+  'Global HaruReady.i = #False ; authoritative readiness: 1 = initialized and fully bound',
 ];
 let implementation = source.slice(privateStart, end).trimEnd();
 for (const declaration of diagnostics) {
@@ -40,11 +41,14 @@ const header = `; --------------------------------------------------------------
 ;
 ; Public API: HPDF::HaruInit(), HPDF::HPDF_*, HPDF::Haru*,
 ; HPDF::#HPDF_*, HPDF::HPDFPoint / HPDFRect / HPDFDate,
-; HPDF::HaruBound and HPDF::HaruMissing$.
+; HPDF::HaruBound, HPDF::HaruMissing$ and HPDF::HaruReady.
 ; Library handles, binding macro and per-document caches are private.
-; The original names, signatures and lifecycle contract are unchanged:
-; initialize once before using function pointers, free all documents using
-; HaruFree(), then HaruShutdown(). Calls after shutdown are invalid.
+; Lifecycle: initialize once before using function pointers; a second
+; HaruInit() while ready is rejected (-1, library untouched). Free all
+; documents with HaruFree() BEFORE HaruShutdown(). On shutdown and on every
+; failed init all function pointers are cleared and HaruReady = 0: calls
+; after shutdown or a failed init are null-deref invalid. Document resets
+; go through HaruResetDoc / HaruClearDoc / HaruFreeDoc (cache-safe).
 ; Can coexist with hpdf.pbi; each wrapper owns its own library/cache state.
 ; Prefer qualified names over UseModule HPDF when including both wrappers.
 ; ----------------------------------------------------------------------------

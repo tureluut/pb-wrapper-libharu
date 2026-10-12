@@ -9,13 +9,19 @@ needed**.
 - **License:** free to use. The shipped DLLs carry their own licenses, see
   [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (libharu, zlib, libpng —
   all permit free commercial use and redistribution).
-- **Requirements:** PureBasic **6.40 or higher**.
+- **Requirements:** PureBasic **6.40 or higher**, **x64** (compile-time
+  guards reject other targets), Windows or Linux.
 - **Verified platforms:** Windows x64 and WSL2 Ubuntu 26.04.1 / Linux x64
   (PureBasic 6.41 C backend, gcc 15.2). Linux uses SysV ABI shims for
   by-value rectangle/date arguments; those shims are x64-specific — the
   wrapper is **not** verified with a 32-bit PB compiler. A 32-bit
   `libhpdf.so` is provided and verified at C-ABI level (see
   `libraries/linux/x86/` and `WSL-VERIFICATION.md`).
+- **Threading:** the wrapper is **thread-confined** — drive the whole API
+  (init, documents, caches, shutdown) from one thread, or serialize every
+  call externally. The loader state and both per-document cache maps are
+  process globals and are not synchronized, not even in a thread-safe PB
+  build; map iteration mutates shared collection state.
 
 ## Files
 
@@ -24,6 +30,7 @@ needed**.
 | `hpdf.pbi`                 | The wrapper: constants, `HPDFPoint`/`HPDFRect`/`HPDFDate` structs (C-aligned), **169 prototypes** + fn-pointer globals, `HaruInit()`/`HaruShutdown()`, `Haru*` + raw-byte helpers — see the header comments, they are the authority |
 | `hpdf_module.pbi`          | Standalone `HPDF::` module alternative with the same 169 function pointers and all helpers; library handles, binding macro and caches are private |
 | `tools/generate_hpdf_module.cjs` | Regenerates the module from `hpdf.pbi`; `--check` verifies it is in sync (Node.js required only for regeneration) |
+| `tests/regression.pb` | Focused regression tests for the lifecycle/error contracts (alpha validation, cache invalidation, EndText status propagation, init/shutdown state); exit code = number of failed checks |
 | `samples/hpdf_module_smoke.pb` | Namespaced module smoke test using bundled assets; writes `hpdf_module_smoke.pdf` |
 | `libraries/windows/x64/`   | `hpdf.dll` + `zlib.dll` + `libpng16.dll`, 64-bit — the current, tested setup                                                         |
 | `libraries/windows/x86/`   | The same DLL set, 32-bit builds (provided for x86 targets; not covered by the current test setup)                                    |
@@ -154,12 +161,14 @@ All compile against the extended wrapper and produce their PDF:
 XIncludeFile "hpdf.pbi"    ; adjust path to your project
 
 Procedure Main()
-  ; HaruInit() ONCE, before ANY HPDF_* / Haru* call:
-  ;   no argument   -> DLLs must sit beside the exe (OpenLibrary searches
-  ;                    the exe directory first)
-  ;   dir$ argument -> DLLs are loaded from that directory (must end with
-  ;                    "/" or "\", e.g. "libraries/windows/x64/")
-  If HaruInit("libraries/windows/x64/") = 0
+  ; HaruInit() ONCE, before ANY HPDF_* / Haru* call. Returns:
+  ;   1  success (HaruReady = #True)
+  ;  -1  rejected: already initialized while ready - library untouched;
+  ;      call HaruShutdown() first to switch libraries/configuration
+  ;   0  failure (DLL/dependency missing or wrong version; all function
+  ;      pointers are cleared; retry is allowed)
+  ; dir$ may be given with or without a trailing separator.
+  If HaruInit("libraries/windows/x64") <> 1
     Debug "hpdf init failed: " + HaruMissing$   ; "" = DLL not found
     End 1
   EndIf
@@ -182,7 +191,42 @@ Usage contract:
 - **`HaruInit()` before every other call.** Every `HPDF_*` name in the
   include is a global function _pointer_; calling before init dereferences
   null. Pair with `HaruShutdown()`.
-- Helpers expect a doc from `HaruNew()` (UTF-8 encoder already set).
+- **Return codes:** `1` = success (`HaruReady = #True`); `-1` = rejected
+  because the wrapper is already initialized and ready — the live library is
+  untouched, call `HaruShutdown()` first; `0` = failure (library or
+  dependency missing, or a wrong library version — `HaruMissing$ = ""` means
+  the library never opened, non-empty means it opened but lacks exports).
+  On every failure path and in `HaruShutdown()` **all function pointers are
+  cleared**, so a stale call faults visibly at the null dereference instead
+  of jumping into unloaded code. Retrying `HaruInit()` after a failure or a
+  shutdown is allowed. `HaruBound` / `HaruMissing$` remain diagnostics of
+  the last binding attempt; `HaruReady` is the authoritative readiness flag.
+- **Document lifecycle:** helpers expect a doc from `HaruNew()` (UTF-8
+  encoder already set). To destroy or reset document contents, use only
+  `HaruFree` / `HaruFreeDoc` / `HaruResetDoc` / `HaruClearDoc` — they purge
+  the per-document font/ExtGState caches BEFORE the native call and restore
+  the UTF-8 pipeline afterwards. The raw exports `HPDF_NewDoc`,
+  `HPDF_FreeDoc`, `HPDF_FreeDocAll` and `HPDF_Free` bypass cache
+  invalidation and encoder restoration — **do not use them on
+  helper-managed documents**. Free all documents with `HaruFree` before
+  `HaruShutdown()` (the wrapper does not track live documents).
+- **Status adapter contract:** libharu's `HPDF_STATUS` is C `unsigned long`
+  — 4 bytes on Windows LLP64 but **8 bytes on Linux LP64**. Status-returning
+  prototypes deliberately use `.l` and return the **low 32 bits**; all
+  libharu error constants fit in 32 bits, so statuses compare equal on both
+  platforms. Treat statuses as opaque: compare against `#HPDF_OK` or
+  `HPDF_GetError()` values, never interpret them beyond 32 bits.
+- **File-path policy:** filename parameters use `p-utf8` on Linux (pathname
+  bytes are UTF-8) and `p-ascii` on Windows (narrow ANSI paths — non-ASCII
+  Windows paths follow the system code page and are not portable). Text,
+  identifier, password and pathname encodings are separate policies.
+  Loader: `dir$` is trusted explicitly and accepted **with or without a
+  trailing separator**; `dir$ = ""` falls back to the exe directory / OS
+  search path — only point it at trusted directories.
+- **Compile-time guards:** unsupported OS (not Windows/Linux) and non-x64
+  targets raise `CompilerError`; structure layouts (`HPDFPoint` 8,
+  `HPDFRect` 16, `HPDFDate` 36 bytes incl. `ind@24`/`off_hour@28`) are
+  asserted at compile time.
 - `HaruErrorText(pdf)` returns `"err <hex>/<hex>"` for FAIL diagnostics
   (libharu errors **latch** until `HPDF_ResetError`).
 - Runtime DLLs: `hpdf.dll` + `zlib.dll` + `libpng16.dll` (the latter two are
@@ -224,7 +268,8 @@ HPDF::HaruShutdown()
 
 - Constants: `HPDF::#HPDF_PAGE_SIZE_A4`, `HPDF::#HPDF_OK`, etc.
 - Structures: `Define rect.HPDF::HPDFRect` (also `HPDFPoint`, `HPDFDate`).
-- Diagnostics: `HPDF::HaruBound` and `HPDF::HaruMissing$`.
+- Diagnostics: `HPDF::HaruBound`, `HPDF::HaruMissing$` and the readiness
+  flag `HPDF::HaruReady`.
 - Library/dependency handles, `HaruBind` and per-document caches are private.
 - For a minimal migration, change the include and add `UseModule HPDF`;
   existing unqualified API calls can then remain unchanged.
@@ -232,9 +277,11 @@ HPDF::HaruShutdown()
   loader/cache state; initialize, use and shut down each separately, and
   keep a document's lifecycle within the wrapper that created it. Avoid
   `UseModule HPDF` when also including the flat wrapper.
-- The same lifecycle restrictions apply: initialize once successfully before
-  calling function pointers, free documents with `HaruFree`, then shut down.
-  Function pointers must not be called before init or after shutdown.
+- The same lifecycle contract applies: initialize once successfully before
+  calling function pointers (`-1` while ready, `0` on failure with all
+  pointers cleared), free documents with `HaruFree` (or the
+  `HaruFreeDoc`/`HaruResetDoc`/`HaruClearDoc` lifecycle helpers), then shut
+  down. Function pointers must not be called before init or after shutdown.
 
 Compile/run `samples/hpdf_module_smoke.pb` from `samples/` to exercise the
 module with the bundled TTF, raw WinAnsi text, public structure layouts,
@@ -257,14 +304,17 @@ is **not** needed to compile or distribute the PureBasic module.
 | ------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `HaruNew()`                                       | doc with `HPDF_UseUTFEncodings` + encoder "UTF-8"; 0 on fail                                                                                                                                                      |
 | `HaruFree(pdf)`                                   | frees doc + purges per-doc caches                                                                                                                                                                                 |
+| `HaruFreeDoc(pdf)`                                | frees the doc's contents (`HPDF_FreeDoc`) + purges caches; the doc allocation survives — call `HaruResetDoc` before reuse                                                                                          |
+| `HaruResetDoc(pdf)`                               | purge caches → `HPDF_NewDoc` → re-select the "UTF-8" encoder; keeps the registered encoder list. Returns `#HPDF_OK` or the first failing status                                                                    |
+| `HaruClearDoc(pdf)`                               | scorched-earth reset: purge caches → `HPDF_FreeDocAll` (doc becomes invalid) → `HPDF_NewDoc` → full `HPDF_UseUTFEncodings` pipeline re-registered. Returns `#HPDF_OK` or the first failing status                                   |
 | `HaruErrorText(pdf)`                              | `"err <error-hex>/<detail-hex>"`                                                                                                                                                                                  |
 | `HaruTTFFont(pdf, path$)`                         | loads + embeds TTF, caches per doc+path; `HPDF_LoadTTFontFromFile2` is **TTC-only** in 2.4.6 (plain TTF retry handled internally); never pre-probe font paths with PB `ReadFile` (fails under `C:\Windows\Fonts`) |
 | `HaruAddPage(pdf)`                                | A4 portrait                                                                                                                                                                                                       |
 | `HaruPngFromFile(pdf, path$)`                     | `HPDF_LoadPngImageFromFile2` (PNG is read at `HPDF_SaveToFile` time — keep the file around until the save)                                                                                                        |
-| `HaruAlpha(pdf, a.f)`                             | cached ExtGState with fill+stroke alpha                                                                                                                                                                           |
-| `HaruTextOut(page, x, y, s$)`                     | brackets `BeginText`/`EndText` itself — raw `HPDF_Page_TextOut` demands TEXT_OBJECT gmode                                                                                                                         |
+| `HaruAlpha(pdf, a.f)`                             | cached ExtGState with fill+stroke alpha; validates the range **and** rejects NaN/±Infinity by bit pattern (PB float compares are non-IEEE for NaN and libharu's C range check lets NaN through), checks BOTH setter statuses, caches only after success — 0 on any failure; cache key is the IEEE-754 bit pattern |
+| `HaruTextOut(page, x, y, s$)`                     | brackets `BeginText`/`EndText` itself — raw `HPDF_Page_TextOut` demands TEXT_OBJECT gmode; returns the first failing status including a failed `EndText` finalization                                              |
 | `HaruWinAnsiMem(s$)`                              | PB string → NUL-terminated WinAnsi/CP1252 byte buffer (`AllocateMemory`, caller frees); locale-independent                                                                                                        |
-| `HaruTextOutRaw(page, x, y, *bytes)`              | as `HaruTextOut` but takes pre-encoded WinAnsi bytes — for **base-14 (non-embedded) fonts** (single-byte fonts do no conversion; raw byte pass-through)                                                           |
+| `HaruTextOutRaw(page, x, y, *bytes)`              | as `HaruTextOut` but takes pre-encoded WinAnsi bytes — for **base-14 (non-embedded) fonts** (single-byte fonts do no conversion; raw byte pass-through); same first-error-wins status handling                                      |
 | `HPDF_Page_TextOutRaw` / `HPDF_Page_TextWidthRaw` | same DLL exports as `TextOut`/`TextWidth`, bound with raw `char*` instead of `p-utf8` — pair with `HaruWinAnsiMem`                                                                                                |
 
 ## Type-mapping rules (for every new declaration)
@@ -282,6 +332,41 @@ header:
 | display-text params                                                  | `.p-utf8`                         | `TextOut`, `ShowText`, `ShowTextNextLine`, `TextWidth`, `MeasureText`, `TextRect` (UTF-8 encoder docs only) |
 | `char *` return                                                      | `.i` + `PeekS(*p, -1, #PB_Ascii)` | pseudotypes are **params-only** on prototypes                                                               |
 | struct-by-value returns                                              | **banned**                        | use the `…2` out-param variants (`HPDF_Image_GetSize2`, `HPDF_Page_GetCurrentPos2`, …)                      |
+
+`HPDF_STATUS` deserves the explicit adapter note: native C `unsigned long`
+is 8 bytes on Linux LP64, so the `.l` prototypes truncate to the low 32
+bits (see the status adapter contract under **Usage contract**). Unsigned
+`HPDF_UINT`/`HPDF_UINT32`/`HPDF_UNICODE` values keep their width in
+`.l`/`.w` but arrive sign-interpreted — widen before unsigned arithmetic
+when values can exceed `$7FFFFFFF` / `$7FFF`.
+
+## Tests
+
+`tests/regression.pb` is a Windows console program covering the contracts
+above at the behavior level (run it with `tests/` as working directory;
+exit code = number of failed checks — 0 = all pass):
+
+- **R1 alpha validation:** `-0.5`/`1.5`/NaN rejected with no cache entry;
+  `0.0`/`1.0` endpoints cached; repeated value returns the same handle; the
+  raw setter still latches `HPDF_EXT_GSTATE_OUT_OF_RANGE` (`$1080`), cleared
+  by `HPDF_ResetError`.
+- **R3 status propagation:** a stubbed `HPDF_Page_EndText` returning `$DEAD`
+  is no longer masked — `HaruTextOut`/`HaruTextOutRaw` return it.
+- **R2 lifecycle/cache invalidation:** `HaruResetDoc`/`HaruClearDoc` purge
+  both caches and keep UTF-8 text working; `HaruFreeDoc` + `HaruResetDoc`
+  revive; freeing doc A leaves doc B's cache entries intact.
+- **R4/R5 init/shutdown state:** re-init while ready returns `-1` with the
+  library untouched; shutdown and failed init clear every pointer and
+  `HaruReady`; retry after failure succeeds.
+- **R6/R7/R9:** runtime structure-layout checks (compile-time asserts also
+  guard `hpdf.pbi`), status adapter spot check, init directory without
+  trailing separator.
+
+```bash
+cd tests
+MSYS2_ARG_CONV_EXCL='*' "$PUREBASIC_HOME/Compilers/pbcompilerc.exe" regression.pb /CONSOLE /EXE regression.exe
+./regression.exe ; echo $?
+```
 
 ## Distribution
 

@@ -18,7 +18,9 @@ and a fresh re-run of every check described below.
 ## Linux x64 — sample suite
 
 Verified result: **27 PASS, 0 FAIL, 2 SKIP** (re-confirmed with a fresh
-run; same numbers as the original session).
+run after the R1–R9 hardening changes — lifecycle helpers, `HaruReady`,
+pointer clearing in `HaruInit`/`HaruShutdown`, Linux dir normalization;
+same numbers as the original session).
 
 - All 29 sample programs **compile** with the C backend
   (`pbcompilerc -cl -t`, gcc behind it).

@@ -22,8 +22,10 @@
 ;     candidates cover distro runtime packages that ship only the versioned
 ;     soname. zlib/libpng are ld.so-resolved (system packages) or statically
 ;     baked into libhpdf.so, so the Windows dependency-preload is Windows-
-;     only. Strings need NO changes: PB is UCS-2 internally on every OS, so
-;     p-ascii/p-utf8 param conversion behaves identically, and #PB_Ascii
+;     only. String policies are explicit: text/identifier params keep the
+;     same p-ascii/p-utf8 prototypes on both OSes, but FILE-PATH params are
+;     OS-conditional (p-utf8 on Linux - UTF-8 is the native pathname form -
+;     p-ascii ANSI on Windows), see the File-path exports block. #PB_Ascii
 ;     PeekS on the (7-bit ASCII) version / font-name returns is exact on
 ;     Linux too.
 ;     b) SysV struct ABI - libharu takes HPDF_Rect/HPDF_Date/HPDF_Point BY
@@ -39,16 +41,66 @@
 ; USAGE CONTRACT: call HaruInit() once, before any HPDF_* / Haru* call.
 ; Every HPDF_* name below is a global function POINTER (prototype-typed);
 ; calling it before HaruInit() dereferences null. HaruShutdown() at exit.
+; A failed HaruInit() or a HaruShutdown() CLEARS every HPDF_* pointer (and
+; the Linux shim backings): stale pointers can never be called by mistake,
+; a non-null HPDF_* pointer therefore means "currently bound and usable".
 ;
-; Type-mapping rules (every prototype, kept 1:1 with hpdf.h):
+; LIFECYCLE POLICY (explicit, enforced where cheap):
+;   - HaruInit() rejects a second call while initialized (returns -1, the
+;     live library is untouched). After a failed attempt or HaruShutdown()
+;     a retry is allowed. HaruReady is the authoritative readiness flag;
+;     HaruBound / HaruMissing$ are diagnostics of the LAST binding attempt,
+;     not a readiness test.
+;   - Create documents with HaruNew() (UTF-8 pipeline) and free them with
+;     HaruFree(). Destroy/reset document CONTENTS only through the
+;     cache-aware helpers HaruResetDoc() / HaruClearDoc() / HaruFreeDoc():
+;     the raw HPDF_NewDoc / HPDF_FreeDoc / HPDF_FreeDocAll exports free the
+;     objects behind cached font/ExtGState handles WITHOUT purging the
+;     helper caches (stale-handle hazard). Raw HPDF_Free bypasses cache
+;     cleanup as well - never use it on helper-managed documents.
+;   - Free all documents (HaruFree) BEFORE HaruShutdown(); the wrapper does
+;     not track live documents, so that part stays a documented duty.
+;
+; THREADING CONTRACT: this wrapper is thread-CONFINED, not thread-safe,
+; even in a thread-safe PB build. HaruLib/HaruReady/HaruBound and both
+; helper caches are process-global mutable state (map lookups mutate the
+; selected element). Use HaruInit / HPDF_* / Haru* / HaruShutdown from one
+; thread, or serialize externally. Sharing ONE document across threads is
+; a libharu-level hazard no wrapper map lock can fix.
+;
+; FILENAME / LOADER POLICY: file-path prototypes convert with p-utf8 on
+; Linux (UTF-8 pathname bytes are the OS native form) and p-ascii (ANSI
+; narrow path) on Windows - see the "File-path exports" block below; text,
+; identifier and password parameters keep their own separate policies.
+; HaruInit(dir$) accepts the directory with or without a trailing
+; separator. Prefer an explicit, trusted directory over the default search
+; (exe dir / cwd / ld.so or DLL search paths): loading a library from a
+; writable location can execute an unintended binary.
+;
+; Type-mapping rules (every prototype, kept 1:1 with hpdf.h except where a
+; declared adapter contract says otherwise):
 ;   HPDF_REAL (C float)                       -> .f        never .d
-;   HPDF_BOOL/STATUS/UINT/INT/UINT32/enums    -> .l        4-byte C int; the
-;     explicit .l return reads eax only (x64 rax sign-extension hygiene)
-;   HPDF_UINT16                               -> .w
+;   HPDF_BOOL/UINT/INT/enums                  -> .l        4-byte C int on
+;     every supported OS; the explicit .l return reads eax only (x64 rax
+;     sign-extension hygiene)
+;   HPDF_STATUS                               -> .l        DECLARED ADAPTER
+;     CONTRACT, not a verbatim type mapping: libharu defines it as C
+;     "unsigned long" - 4 bytes on Windows (LLP64), 8 bytes on Linux x64
+;     (LP64). The .l return reads the low 32 bits (eax), which is lossless
+;     for every status/error-detail value libharu produces (small non-
+;     negative error codes). Treat results as opaque "0 = OK" codes; do not
+;     store them in C-matched types. Callback prototypes matching native
+;     HPDF_STATUS (HPDF_Error_Handler, user alloc/free fns passed to
+;     HPDF_NewEx) must use the same .l normalization.
+;   HPDF_UINT32 (stream sizes) / HPDF_UINT16 (HPDF_UNICODE) -> .l / .w
+;     width-preserving but SIGNED in PB: zero-extend (& $FFFFFFFF / &
+;     $FFFF) before arithmetic or comparison when the high bit can be set.
+;   HPDF_UINT64                               -> .q
 ;   HPDF_*HANDLE (Doc/Page/Font/Image/...)    -> .i        opaque pointers
 ;   const char* in                            -> .p-ascii  PB converts string
 ;     args per call; pointer valid for call duration only (libharu consumes
-;     synchronously - never store it)
+;     synchronously - never store it). EXCEPTION: file-path params, see the
+;     File-path exports block.
 ;   const char* page-text fns                 -> .p-utf8  wrapper is UTF-8-first
 ;     (HaruNew enables UTF-8 encodings); applies to TextOut, ShowText,
 ;     ShowTextNextLine, TextWidth, MeasureText, TextRect
@@ -58,6 +110,21 @@
 ;   struct-by-value returns                   -> BANNED in v1; use the ...2
 ;     variants (HPDF_Image_GetSize2, HPDF_Page_GetCurrentPos2, ...)
 ; ----------------------------------------------------------------------------
+
+; ----------------------------------------------------------------------------
+; Compile-time platform guard (review R6): the supported matrix is exactly
+; what is verified - Windows x64 (Win64 hidden-pointer struct ABI) and
+; Linux x64 (SysV x86-64 shim block below). Everything else is rejected at
+; compile time instead of mis-binding at runtime. The x86 DLL/so sets in
+; libraries/ are NOT covered: this wrapper's pointer prototypes and shims
+; are 64-bit only.
+; ----------------------------------------------------------------------------
+CompilerIf #PB_Compiler_OS <> #PB_OS_Windows And #PB_Compiler_OS <> #PB_OS_Linux
+  CompilerError "hpdf.pbi: unsupported OS - only Windows and Linux builds are implemented/tested."
+CompilerEndIf
+CompilerIf #PB_Compiler_Processor <> #PB_Processor_x64
+  CompilerError "hpdf.pbi: unsupported CPU - only 64-bit x86 targets are implemented/tested (Win64 struct ABI / SysV x86-64 shims)."
+CompilerEndIf
 
 ; -----------------
 ; Constants subset 
@@ -284,6 +351,19 @@ Structure HPDFDate Align #PB_Structure_AlignC
   off_minutes.l
 EndStructure
 
+; Executable layout assertions (review R6/practices): fail the build instead
+; of mis-packing the SysV shim bytes or the Win64 hidden-pointer structs when
+; a future edit drifts the C-aligned layouts.
+CompilerIf SizeOf(HPDFPoint) <> 8
+  CompilerError "HPDFPoint layout drift: expected 8 bytes (2 x HPDF_REAL)."
+CompilerEndIf
+CompilerIf SizeOf(HPDFRect) <> 16
+  CompilerError "HPDFRect layout drift: expected 16 bytes (4 x HPDF_REAL, no padding)."
+CompilerEndIf
+CompilerIf SizeOf(HPDFDate) <> 36 Or OffsetOf(HPDFDate\ind) <> 24 Or OffsetOf(HPDFDate\off_hour) <> 28
+  CompilerError "HPDFDate layout drift: expected 36 bytes with ind@24, off_hour@28, off_minutes@32 (C alignment)."
+CompilerEndIf
+
 ; ----------------------------------------------------------------------------
 ; Prototypes - signatures verbatim from hpdf.h 2.4.6 (x64: stdcall == C
 ; convention, so plain Prototype is correct). Pseudotypes are legal on
@@ -310,7 +390,7 @@ Prototype.l Proto_HPDF_SaveToStream(pdf.i)                                   ; H
 Prototype.l Proto_HPDF_GetStreamSize(pdf.i)                                  ; HPDF_UINT32
 Prototype.l Proto_HPDF_ReadFromStream(pdf.i, *buf, *size)                    ; HPDF_STATUS; *size = HPDF_UINT32* in/out
 Prototype.l Proto_HPDF_ResetStream(pdf.i)                                    ; HPDF_STATUS
-Prototype.l Proto_HPDF_SaveToFile(pdf.i, file_name.p-ascii)                  ; HPDF_STATUS
+; (file-path exports like SaveToFile live in the File-path exports block below)
 
 Prototype.l Proto_HPDF_GetError(pdf.i)                                       ; HPDF_STATUS
 Prototype.l Proto_HPDF_GetErrorDetail(pdf.i)                                 ; HPDF_STATUS
@@ -394,15 +474,15 @@ Prototype.l Proto_HPDF_Page_GRestore(page.i)                                 ; H
 Prototype.l Proto_HPDF_Page_Concat(page.i, a.f, b.f, c.f, d.f, x.f, y.f)     ; HPDF_STATUS; cm
 
 Prototype.i Proto_HPDF_GetFont(pdf.i, font_name.p-ascii, encoding_name.p-ascii)          ; HPDF_Font
-Prototype.i Proto_HPDF_LoadTTFontFromFile(pdf.i, file_name.p-ascii, embedding.l)         ; const char* -> .i (font name; PeekS ascii)
-Prototype.i Proto_HPDF_LoadTTFontFromFile2(pdf.i, file_name.p-ascii, index.l, embedding.l) ; const char* -> .i (font name; PeekS ascii)
+; (LoadTTFontFromFile / LoadTTFontFromFile2 are file-path exports, see the
+;  File-path exports block below)
 Prototype.l Proto_HPDF_Font_GetAscent(font.i)                                 ; HPDF_INT
 Prototype.l Proto_HPDF_Font_GetDescent(font.i)                                ; HPDF_INT
 Prototype.l Proto_HPDF_UseUTFEncodings(pdf.i)                                 ; HPDF_STATUS
 Prototype.l Proto_HPDF_SetCurrentEncoder(pdf.i, encoding_name.p-ascii)        ; HPDF_STATUS
 
-Prototype.i Proto_HPDF_LoadPngImageFromFile2(pdf.i, filename.p-ascii)         ; HPDF_Image
-Prototype.i Proto_HPDF_LoadJpegImageFromFile(pdf.i, filename.p-ascii)         ; HPDF_Image
+; (Png/Jpeg image loading from FILE are file-path exports, see the File-path
+;  exports block below)
 Prototype.l Proto_HPDF_Image_GetWidth(image.i)                                ; HPDF_UINT
 Prototype.l Proto_HPDF_Image_GetHeight(image.i)                               ; HPDF_UINT
 Prototype.l Proto_HPDF_Image_GetSize2(image.i, *size)                         ; HPDF_STATUS; *size = HPDF_Point* out (struct-by-value GetSize banned)
@@ -448,13 +528,13 @@ Prototype.w Proto_HPDF_Encoder_GetUnicode(encoder.i, code.w)       ; HPDF_UNICOD
 
 ; --- fonts ------------------------------------------------------------------
 Prototype.i Proto_HPDF_GetFontN(pdf.i, *font_name, *encoding_name) ; = HPDF_GetFont, raw; *encoding_name = 0 -> C NULL (font default)
-Prototype.i Proto_HPDF_LoadType1FontFromFile(pdf.i, afm_file_name.p-ascii, data_file_name.p-ascii) ; const char*
+; (LoadType1FontFromFile is a file-path export, see the File-path exports block below)
 Prototype.i Proto_HPDF_Font_GetFontName(font.i)                    ; const char* -> .i
 Prototype.i Proto_HPDF_Font_GetEncodingName(font.i)                ; const char* -> .i
 
 ; --- images ------------------------------------------------------------------
-Prototype.i Proto_HPDF_LoadPngImageFromFile(pdf.i, filename.p-ascii)   ; (FromFile2 is the keep-file-around variant)
-Prototype.i Proto_HPDF_LoadRawImageFromFile(pdf.i, filename.p-ascii, width.l, height.l, color_space.l)
+; (PngImageFromFile / RawImageFromFile are file-path exports, see the
+;  File-path exports block below)
 Prototype.i Proto_HPDF_LoadRawImageFromMem(pdf.i, *buf, width.l, height.l, color_space.l, bits_per_component.l)
 Prototype.l Proto_HPDF_Image_SetMaskImage(image.i, mask_image.i)
 Prototype.l Proto_HPDF_Image_SetColorMask(image.i, rmin.l, rmax.l, gmin.l, gmax.l, bmin.l, bmax.l)
@@ -485,7 +565,8 @@ Prototype.l Proto_HPDF_Page_SetSlideShow(page.i, trans_style.l, disp_time.f, tra
 Prototype.l Proto_HPDF_Page_ShowTextRaw(page.i, *bytes)            ; = HPDF_Page_ShowText, raw char*
 
 ; --- attachments / encryption / PDF-A ----------------------------------------
-Prototype.i Proto_HPDF_AttachFile(pdf.i, file.p-ascii)             ; HPDF_EmbeddedFile (2.4.6 returns the handle)
+; (AttachFile and LoadIccProfileFromFile are file-path exports, see the
+;  File-path exports block below)
 Prototype.l Proto_HPDF_EmbeddedFile_SetName(emfile.i, name.p-ascii)
 Prototype.l Proto_HPDF_EmbeddedFile_SetDescription(emfile.i, new_description.p-ascii)
 Prototype.l Proto_HPDF_EmbeddedFile_SetSubtype(emfile.i, subtype.p-ascii)
@@ -500,13 +581,47 @@ Prototype.l Proto_HPDF_SetInfoDateAttr(pdf.i, infoType.l, *date)   ; "type" rena
 Prototype.l Proto_HPDF_SetPDFAConformance(pdf.i, pdfa_type.l)      ; HPDF_PDFAType
 Prototype.l Proto_HPDF_AddPDFAXmpExtension(pdf.i, xmp_description.p-ascii)
 Prototype.l Proto_HPDF_AppendOutputIntents(pdf.i, iccname.p-ascii, iccdict.i)  ; iccdict = HPDF_OutputIntent
-Prototype.i Proto_HPDF_LoadIccProfileFromFile(pdf.i, icc_file_name.p-ascii, numcomponent.l) ; HPDF_OutputIntent
 
 ; --- streams (raw image/asset dumping, e.g. make_rawimage) --------------------
 Prototype.i Proto_HPDF_GetPageMMgr(page.i)                         ; HPDF_MMgr (the doc's mmgr)
-Prototype.i Proto_HPDF_FileWriter_New(mmgr.i, file_name.p-ascii)   ; HPDF_Stream
 Prototype.l Proto_HPDF_Stream_WriteToStream(in_stream.i, out_stream.i, filter.l, e.i) ; filter 0 = raw, e = NULL
 Prototype   Proto_HPDF_Stream_Free(stream.i)
+
+; ----------------------------------------------------------------------------
+; File-path exports - pathname encoding is an explicit OS boundary (review
+; R9). Linux: UTF-8 pathname bytes are the native form, so these prototypes
+; convert with p-utf8 and Unicode path components survive. Windows: libharu
+; opens narrow char* paths via the ANSI CRT, so p-ascii is the documented
+; policy - non-ANSI path components do NOT round-trip there; stage such
+; files under an ANSI-named directory yourself (or extend the wrapper with
+; a staging helper). Text, identifier and password parameters keep their
+; own separate encoding policies (see the type-mapping rules).
+; ----------------------------------------------------------------------------
+CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+  Prototype.l Proto_HPDF_SaveToFile(pdf.i, file_name.p-utf8)                  ; HPDF_STATUS
+  Prototype.i Proto_HPDF_LoadTTFontFromFile(pdf.i, file_name.p-utf8, embedding.l)         ; const char* -> .i (font name; PeekS ascii)
+  Prototype.i Proto_HPDF_LoadTTFontFromFile2(pdf.i, file_name.p-utf8, index.l, embedding.l) ; const char* -> .i (font name; PeekS ascii)
+  Prototype.i Proto_HPDF_LoadPngImageFromFile2(pdf.i, filename.p-utf8)         ; HPDF_Image
+  Prototype.i Proto_HPDF_LoadJpegImageFromFile(pdf.i, filename.p-utf8)         ; HPDF_Image
+  Prototype.i Proto_HPDF_LoadPngImageFromFile(pdf.i, filename.p-utf8)   ; (FromFile2 is the keep-file-around variant)
+  Prototype.i Proto_HPDF_LoadRawImageFromFile(pdf.i, filename.p-utf8, width.l, height.l, color_space.l)
+  Prototype.i Proto_HPDF_LoadType1FontFromFile(pdf.i, afm_file_name.p-utf8, data_file_name.p-utf8) ; const char*
+  Prototype.i Proto_HPDF_AttachFile(pdf.i, file.p-utf8)             ; HPDF_EmbeddedFile (2.4.6 returns the handle)
+  Prototype.l Proto_HPDF_LoadIccProfileFromFile(pdf.i, icc_file_name.p-utf8, numcomponent.l) ; HPDF_OutputIntent
+  Prototype.i Proto_HPDF_FileWriter_New(mmgr.i, file_name.p-utf8)   ; HPDF_Stream
+CompilerElse
+  Prototype.l Proto_HPDF_SaveToFile(pdf.i, file_name.p-ascii)                  ; HPDF_STATUS
+  Prototype.i Proto_HPDF_LoadTTFontFromFile(pdf.i, file_name.p-ascii, embedding.l)         ; const char* -> .i (font name; PeekS ascii)
+  Prototype.i Proto_HPDF_LoadTTFontFromFile2(pdf.i, file_name.p-ascii, index.l, embedding.l) ; const char* -> .i (font name; PeekS ascii)
+  Prototype.i Proto_HPDF_LoadPngImageFromFile2(pdf.i, filename.p-ascii)         ; HPDF_Image
+  Prototype.i Proto_HPDF_LoadJpegImageFromFile(pdf.i, filename.p-ascii)         ; HPDF_Image
+  Prototype.i Proto_HPDF_LoadPngImageFromFile(pdf.i, filename.p-ascii)   ; (FromFile2 is the keep-file-around variant)
+  Prototype.i Proto_HPDF_LoadRawImageFromFile(pdf.i, filename.p-ascii, width.l, height.l, color_space.l)
+  Prototype.i Proto_HPDF_LoadType1FontFromFile(pdf.i, afm_file_name.p-ascii, data_file_name.p-ascii) ; const char*
+  Prototype.i Proto_HPDF_AttachFile(pdf.i, file.p-ascii)             ; HPDF_EmbeddedFile (2.4.6 returns the handle)
+  Prototype.l Proto_HPDF_LoadIccProfileFromFile(pdf.i, icc_file_name.p-ascii, numcomponent.l) ; HPDF_OutputIntent
+  Prototype.i Proto_HPDF_FileWriter_New(mmgr.i, file_name.p-ascii)   ; HPDF_Stream
+CompilerEndIf
 
 ; ----------------------------------------------------------------------------
 ; Function-pointer globals - the HPDF_* names used by callers. Assigned by
@@ -711,8 +826,9 @@ Global HPDF_Stream_Free.Proto_HPDF_Stream_Free
 ; ----------------------------------------------------------------------------
 
 Global HaruLib.i      ; OpenLibrary(#PB_Any) id, 0 = not loaded
-Global HaruBound.i    ; functions successfully bound by HaruInit()
-Global HaruMissing$   ; functions that failed to bind ("" = all bound)
+Global HaruBound.i    ; functions successfully bound by HaruInit() (diagnostic of the last attempt)
+Global HaruMissing$   ; functions that failed to bind ("" = all bound; diagnostic of the last attempt)
+Global HaruReady.i = #False ; authoritative readiness: 1 = initialized and fully bound
 
 ; Binds one export; the name must be given twice because PB macro arguments
 ; are NOT substituted inside string literals.
@@ -854,16 +970,216 @@ CompilerIf #PB_Compiler_OS = #PB_OS_Linux
   EndProcedure
 CompilerEndIf
 
-; Loads the libharu shared library and binds the full export set. Returns 1
-; on success. On failure (library or a dependency missing, or an export not
-; found - i.e. a wrong library version), returns 0; HaruMissing$ / HaruBound
-; carry diagnostics. Call once before any HPDF_* / Haru* use; pair with
-; HaruShutdown().
+; Clears every bound function pointer - the 169 public HPDF_* names and the
+; Linux shim backings - so a failed HaruInit() or a HaruShutdown() can never
+; leave behind non-null pointers into an unloaded library (review R5). After
+; this the HPDF_* names are 0: calling one faults visibly at the call site
+; instead of jumping into unmapped code. Deliberately does NOT touch the
+; HaruBound / HaruMissing$ diagnostics: they describe the last binding
+; attempt, not current readiness - that is HaruReady's job.
+Procedure HaruClearBindings()
+  HPDF_Free = 0
+  HPDF_New = 0
+  HPDF_NewEx = 0
+  HPDF_SetErrorHandler = 0
+  HPDF_FreeDoc = 0
+  HPDF_FreeDocAll = 0
+  HPDF_HasDoc = 0
+  HPDF_NewDoc = 0
+  HPDF_SaveToStream = 0
+  HPDF_GetStreamSize = 0
+  HPDF_ReadFromStream = 0
+  HPDF_ResetStream = 0
+  HPDF_SaveToFile = 0
+  HPDF_GetError = 0
+  HPDF_GetErrorDetail = 0
+  HPDF_ResetError = 0
+  HPDF_CheckError = 0
+  HPDF_GetVersion = 0
+  HPDF_AddPage = 0
+  HPDF_InsertPage = 0
+  HPDF_GetCurrentPage = 0
+  HPDF_GetPageByIndex = 0
+  HPDF_SetPagesConfiguration = 0
+  HPDF_Page_SetWidth = 0
+  HPDF_Page_SetHeight = 0
+  HPDF_Page_SetSize = 0
+  HPDF_Page_SetRotate = 0
+  HPDF_SetCompressionMode = 0
+  HPDF_SetInfoAttr = 0
+  HPDF_Page_BeginText = 0
+  HPDF_Page_EndText = 0
+  HPDF_Page_SetFontAndSize = 0
+  HPDF_Page_TextOut = 0
+  HPDF_Page_TextOutRaw = 0
+  HPDF_Page_TextWidthRaw = 0
+  HPDF_Page_ShowText = 0
+  HPDF_Page_ShowTextNextLine = 0
+  HPDF_Page_MoveTextPos = 0
+  HPDF_Page_MoveTextPos2 = 0
+  HPDF_Page_TextWidth = 0
+  HPDF_Page_MeasureText = 0
+  HPDF_Page_TextRect = 0
+  HPDF_Page_SetCharSpace = 0
+  HPDF_Page_SetWordSpace = 0
+  HPDF_Page_SetTextLeading = 0
+  HPDF_Page_SetHorizontalScalling = 0
+  HPDF_Page_SetTextRenderingMode = 0
+  HPDF_Page_SetTextMatrix = 0
+  HPDF_Page_SetLineWidth = 0
+  HPDF_Page_SetLineCap = 0
+  HPDF_Page_SetLineJoin = 0
+  HPDF_Page_SetDash = 0
+  HPDF_Page_SetFlat = 0
+  HPDF_Page_MoveTo = 0
+  HPDF_Page_LineTo = 0
+  HPDF_Page_CurveTo = 0
+  HPDF_Page_CurveTo2 = 0
+  HPDF_Page_CurveTo3 = 0
+  HPDF_Page_ClosePath = 0
+  HPDF_Page_Rectangle = 0
+  HPDF_Page_Circle = 0
+  HPDF_Page_Ellipse = 0
+  HPDF_Page_Arc = 0
+  HPDF_Page_Stroke = 0
+  HPDF_Page_Fill = 0
+  HPDF_Page_Eofill = 0
+  HPDF_Page_FillStroke = 0
+  HPDF_Page_EofillStroke = 0
+  HPDF_Page_ClosePathStroke = 0
+  HPDF_Page_ClosePathFillStroke = 0
+  HPDF_Page_ClosePathEofillStroke = 0
+  HPDF_Page_EndPath = 0
+  HPDF_Page_Clip = 0
+  HPDF_Page_Eoclip = 0
+  HPDF_Page_SetGrayFill = 0
+  HPDF_Page_SetGrayStroke = 0
+  HPDF_Page_SetRGBFill = 0
+  HPDF_Page_SetRGBStroke = 0
+  HPDF_Page_SetCMYKFill = 0
+  HPDF_Page_SetCMYKStroke = 0
+  HPDF_Page_GSave = 0
+  HPDF_Page_GRestore = 0
+  HPDF_Page_Concat = 0
+  HPDF_GetFont = 0
+  HPDF_LoadTTFontFromFile = 0
+  HPDF_LoadTTFontFromFile2 = 0
+  HPDF_Font_GetAscent = 0
+  HPDF_Font_GetDescent = 0
+  HPDF_UseUTFEncodings = 0
+  HPDF_SetCurrentEncoder = 0
+  HPDF_LoadPngImageFromFile2 = 0
+  HPDF_LoadJpegImageFromFile = 0
+  HPDF_Image_GetWidth = 0
+  HPDF_Image_GetHeight = 0
+  HPDF_Image_GetSize2 = 0
+  HPDF_Page_DrawImage = 0
+  HPDF_CreateExtGState = 0
+  HPDF_ExtGState_SetAlphaFill = 0
+  HPDF_ExtGState_SetAlphaStroke = 0
+  HPDF_ExtGState_SetBlendMode = 0
+  HPDF_Page_SetExtGState = 0
+  HPDF_Page_GetWidth = 0
+  HPDF_Page_GetHeight = 0
+  HPDF_Page_GetLineWidth = 0
+  HPDF_Page_GetCurrentPos2 = 0
+  HPDF_Page_GetCurrentTextPos2 = 0
+  HPDF_Page_GetCurrentFont = 0
+  HPDF_SetOpenAction = 0
+  HPDF_SetPageMode = 0
+  HPDF_Page_CreateDestination = 0
+  HPDF_Destination_SetXYZ = 0
+  HPDF_Destination_SetFit = 0
+  HPDF_CreateOutlineRaw = 0
+  HPDF_Outline_SetOpened = 0
+  HPDF_Outline_SetDestination = 0
+  HPDF_GetEncoder = 0
+  HPDF_UseJPEncodings = 0
+  HPDF_UseJPFonts = 0
+  HPDF_UseKREncodings = 0
+  HPDF_UseKRFonts = 0
+  HPDF_UseCNSEncodings = 0
+  HPDF_UseCNSFonts = 0
+  HPDF_UseCNTEncodings = 0
+  HPDF_UseCNTFonts = 0
+  HPDF_Encoder_GetType = 0
+  HPDF_Encoder_GetByteType = 0
+  HPDF_Encoder_GetUnicode = 0
+  HPDF_GetFontN = 0
+  HPDF_LoadType1FontFromFile = 0
+  HPDF_Font_GetFontName = 0
+  HPDF_Font_GetEncodingName = 0
+  HPDF_LoadPngImageFromFile = 0
+  HPDF_LoadRawImageFromFile = 0
+  HPDF_LoadRawImageFromMem = 0
+  HPDF_Image_SetMaskImage = 0
+  HPDF_Image_SetColorMask = 0
+  HPDF_Image_GetBitsPerComponent = 0
+  HPDF_Image_GetColorSpace = 0
+  HPDF_Page_ExecuteXObject = 0
+  HPDF_Page_CreateLinkAnnot = 0
+  HPDF_Page_CreateURILinkAnnot = 0
+  HPDF_Page_CreateTextAnnotRaw = 0
+  HPDF_LinkAnnot_SetHighlightMode = 0
+  HPDF_LinkAnnot_SetBorderStyle = 0
+  HPDF_TextAnnot_SetIcon = 0
+  HPDF_TextAnnot_SetOpened = 0
+  HPDF_Page_MoveToNextLine = 0
+  HPDF_Page_SetSlideShow = 0
+  HPDF_Page_ShowTextRaw = 0
+  HPDF_AttachFile = 0
+  HPDF_EmbeddedFile_SetName = 0
+  HPDF_EmbeddedFile_SetDescription = 0
+  HPDF_EmbeddedFile_SetSubtype = 0
+  HPDF_EmbeddedFile_SetAFRelationship = 0
+  HPDF_EmbeddedFile_SetSize = 0
+  HPDF_EmbeddedFile_SetCreationDate = 0
+  HPDF_EmbeddedFile_SetLastModificationDate = 0
+  HPDF_SetPassword = 0
+  HPDF_SetPermission = 0
+  HPDF_SetEncryptionMode = 0
+  HPDF_SetInfoDateAttr = 0
+  HPDF_SetPDFAConformance = 0
+  HPDF_AddPDFAXmpExtension = 0
+  HPDF_AppendOutputIntents = 0
+  HPDF_LoadIccProfileFromFile = 0
+  HPDF_GetPageMMgr = 0
+  HPDF_FileWriter_New = 0
+  HPDF_Stream_WriteToStream = 0
+  HPDF_Stream_Free = 0
+  CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+    HaruLnx_Page_CreateLinkAnnot = 0
+    HaruLnx_Page_CreateURILinkAnnot = 0
+    HaruLnx_Page_CreateTextAnnotRaw = 0
+    HaruLnx_EmbeddedFile_SetCreationDate = 0
+    HaruLnx_EmbeddedFile_SetLastModificationDate = 0
+    HaruLnx_SetInfoDateAttr = 0
+  CompilerEndIf
+EndProcedure
+
+; Loads the libharu shared library and binds the full export set. Returns
+;   1  success (HaruReady = 1)
+;  -1  rejected: already initialized - the live library is untouched; call
+;      HaruShutdown() first if a different library/configuration is wanted
+;   0  failure: library or dependency missing, or an export not found
+;      (wrong library version). Diagnostics: HaruMissing$ = "" means the
+;      OpenLibrary stage failed (the directory/name never opened); a
+;      non-empty HaruMissing$ means a library WAS found but does not export
+;      the full 2.4.6 set. On every failure path ALL function pointers are
+;      cleared.
+; RE-INITIALIZATION POLICY: HaruInit() while ready is rejected (-1) instead
+; of silently switching libraries underneath live documents. A retry is
+; allowed after a failed attempt (partial state was fully cleared) and
+; after HaruShutdown(). Never point the wrapper at a different library
+; while documents are alive.
+; HaruReady is the authoritative readiness flag; HaruBound / HaruMissing$
+; only describe the last binding attempt.
 ; Windows: plain-name search (exe dir / PATH) is the OS default when
 ; dir$ = "" (shipped layout: hpdf.dll + zlib.dll + libpng16.dll beside the
-; exe). dir$ (directory WITH trailing slash, "C:/.../libharu/") opens
-; zlib.dll + libpng16.dll FIRST (the loader reuses already-loaded modules
-; by name when it resolves hpdf.dll's imports), then hpdf.dll from dir$.
+; exe). dir$ (a trusted directory, with or without trailing separator)
+; opens zlib.dll + libpng16.dll FIRST (the loader reuses already-loaded
+; modules by name when it resolves hpdf.dll's imports), then hpdf.dll from
+; dir$.
 ; Linux: dlopen has NO exe-directory search, so dir$ = "" resolves the exe
 ; directory via ProgramFilename() and tries, in order: exeDir +
 ; "libhpdf.so", exeDir + "libhpdf.so.2", "./libhpdf.so", then the bare names
@@ -871,12 +1187,28 @@ CompilerEndIf
 ; ld.so.cache, /lib, /usr/lib). zlib/libpng need no preload there: ld.so
 ; resolves the dependencies at dlopen time (system packages) or they are
 ; statically linked into libhpdf.so. dir$ given -> dir$ + "libhpdf.so[.2]"
-; only (an explicit dir is trusted, no fallbacks).
+; only (an explicit dir is trusted, no fallbacks). A missing trailing
+; separator is appended.
 Procedure.i HaruInit(dir$ = "")
+  If HaruReady
+    ProcedureReturn -1
+  EndIf
   HaruMissing$ = ""
   HaruBound = 0
   HaruDepZlib = 0
   HaruDepPng = 0
+  ; accept the directory with or without a trailing separator (review R9)
+  If dir$ <> ""
+    CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+      If Right(dir$, 1) <> "/"
+        dir$ + "/"
+      EndIf
+    CompilerElse
+      If Right(dir$, 1) <> "\" And Right(dir$, 1) <> "/"
+        dir$ + "\"
+      EndIf
+    CompilerEndIf
+  EndIf
   CompilerIf #PB_Compiler_OS = #PB_OS_Linux
     ; dlopen has NO exe-directory search (Windows OpenLibrary does), so the
     ; shipped layout (lib beside exe) is resolved from ProgramFilename().
@@ -929,6 +1261,7 @@ Procedure.i HaruInit(dir$ = "")
       CloseLibrary(HaruDepPng)
       HaruDepPng = 0
     EndIf
+    HaruClearBindings() ; keep the "failed init leaves zeroed pointers" invariant
     ProcedureReturn 0
   EndIf
 
@@ -1149,6 +1482,7 @@ Procedure.i HaruInit(dir$ = "")
   HaruBind(HPDF_Stream_Free, "HPDF_Stream_Free")
 
   If HaruMissing$ <> ""
+    ; wrong library version: close everything and leave NO pointer bound
     CloseLibrary(HaruLib)
     HaruLib = 0
     If HaruDepZlib
@@ -1159,14 +1493,20 @@ Procedure.i HaruInit(dir$ = "")
       CloseLibrary(HaruDepPng)
       HaruDepPng = 0
     EndIf
+    HaruClearBindings()
     ProcedureReturn 0
   EndIf
+  HaruReady = #True
   ProcedureReturn 1
 EndProcedure
 
-; Closes the library. After this, HPDF_* pointers are stale - HaruInit()
-; must be called again before further use. Also closes the dependency
-; handles opened by HaruInit(dir$) (no-op when they were not opened here).
+; Closes the library and the dependency handles, then CLEARS every function
+; pointer: after HaruShutdown() all HPDF_* names are 0 and HaruReady = 0.
+; A new HaruInit() (retry after shutdown) is allowed. CONTRACT: free all
+; documents with HaruFree() BEFORE shutting down - the wrapper does not
+; track live documents, and closing the library under live native objects
+; leaks them. Not thread-safe - see the threading contract in the header.
+; HaruBound / HaruMissing$ keep describing the last binding attempt.
 Procedure HaruShutdown()
   If HaruLib
     CloseLibrary(HaruLib)
@@ -1180,6 +1520,8 @@ Procedure HaruShutdown()
     CloseLibrary(HaruDepPng)
     HaruDepPng = 0
   EndIf
+  HaruClearBindings()
+  HaruReady = #False
 EndProcedure
 
 ; ----------------------------------------------------------------------------
@@ -1187,11 +1529,20 @@ EndProcedure
 ; created by HaruNew() so the UTF-8 pipeline is guaranteed
 ; (HPDF_UseUTFEncodings + current encoder "UTF-8").
 ;
-; Per-doc caches are plain global maps keyed "<doc>|<...>"; HaruFree purges
-; its doc's entries (doc pointers can be reused by a later HPDF_New - stale
-; cache hits would hand out foreign handles). Strings are never stored as C
-; pointers across calls: PB converts PB-string args per call (.p-ascii /
-; .p-utf8), matching the call-duration-only pointer rule of the prototypes.
+; Per-doc caches are plain global maps keyed "<doc>|<...>"; every destructive
+; lifecycle helper (HaruFree / HaruFreeDoc / HaruResetDoc / HaruClearDoc)
+; purges its doc's entries BEFORE the native call (doc pointers can be reused
+; by a later HPDF_New - stale cache hits would hand out foreign handles).
+; Strings are never stored as C pointers across calls: PB converts PB-string
+; args per call (.p-ascii / .p-utf8), matching the call-duration-only pointer
+; rule of the prototypes.
+;
+; LIFECYCLE POLICY (review R2): on documents managed through the helpers,
+; use ONLY HaruFree / HaruFreeDoc / HaruResetDoc / HaruClearDoc to destroy or
+; reset document contents. The raw exports HPDF_NewDoc / HPDF_FreeDoc /
+; HPDF_FreeDocAll / HPDF_Free bypass the cache purge and (for NewDoc /
+; FreeDoc) the UTF-8 pipeline restoration - cached handles they orphan stay
+; in the maps and a later helper call would hand them out.
 ;
 ; ----------------------------------------------------------------------------
 
@@ -1219,8 +1570,10 @@ Procedure.i HaruNew()
   ProcedureReturn pdf
 EndProcedure
 
-; Frees the doc and purges its per-doc cache entries.
-Procedure HaruFree(pdf.i)
+; Purges this doc's entries from both per-doc caches (fonts + ExtGStates).
+; Shared by every destructive lifecycle helper so a reused doc pointer can
+; never serve stale cached handles (review R2).
+Procedure HaruPurgeDocCaches(pdf.i)
   Protected prefix$ = Str(pdf) + "|"
   ForEach HaruFontCache()
     If Left(MapKey(HaruFontCache()), Len(prefix$)) = prefix$
@@ -1232,7 +1585,68 @@ Procedure HaruFree(pdf.i)
       DeleteMapElement(HaruGsCache())
     EndIf
   Next
+EndProcedure
+
+; Frees the doc and purges its per-doc cache entries.
+Procedure HaruFree(pdf.i)
+  HaruPurgeDocCaches(pdf)
   HPDF_Free(pdf)
+EndProcedure
+
+; --- Document lifecycle helpers (review R2) ---------------------------------
+; HPDF_NewDoc internally calls HPDF_FreeDoc first: the old cross-reference
+; and font-manager objects die while the doc allocation survives, so cached
+; font/ExtGState handles become invalid even though the doc POINTER is
+; unchanged. Native facts (verified against hpdf_doc.c 2.4.6 AND at runtime):
+;   - HPDF_FreeDoc frees xref/font manager/fontdefs and NULLs
+;     cur_encoder/def_encoder but KEEPS the encoder list -> after NewDoc/
+;     FreeDoc only the current encoder must be re-selected; re-running
+;     HPDF_UseUTFEncodings would fail HPDF_DUPLICATE_REGISTRATION.
+;   - HPDF_FreeDocAll (VOID in 2.4.6) additionally frees the encoder list
+;     and leaves the doc INVALID (every other call raises
+;     HPDF_INVALID_DOCUMENT) until HPDF_NewDoc rebuilds it - re-registering
+;     the full UTF-8 pipeline afterwards succeeds.
+; All three helpers below purge the caches BEFORE the native call.
+
+; Resets the doc to a fresh empty document and re-selects the UTF-8 encoder
+; (the encoder list survives the internal FreeDoc, so UseUTFEncodings is
+; deliberately NOT re-run). Returns #HPDF_OK (0) or the first failing status.
+Procedure.i HaruResetDoc(pdf.i)
+  Protected ret.i
+  HaruPurgeDocCaches(pdf)
+  ret = HPDF_NewDoc(pdf)
+  If ret <> #HPDF_OK
+    ProcedureReturn ret
+  EndIf
+  ProcedureReturn HPDF_SetCurrentEncoder(pdf, "UTF-8")
+EndProcedure
+
+; Clears all document content through the native FreeDocAll destructor step
+; and rebuilds: HPDF_FreeDocAll (void) frees pages, fontdefs AND the encoder
+; list and leaves the doc invalid, so HPDF_NewDoc rebuilds the document and
+; the FULL UTF-8 pipeline is re-registered (this is the scorched-earth
+; variant of HaruResetDoc, which keeps the encoder list). Returns #HPDF_OK
+; (0) or the first failing status.
+Procedure.i HaruClearDoc(pdf.i)
+  Protected ret.i
+  HaruPurgeDocCaches(pdf)
+  HPDF_FreeDocAll(pdf)                   ; void native - no status to check
+  ret = HPDF_NewDoc(pdf)
+  If ret <> #HPDF_OK
+    ProcedureReturn ret
+  EndIf
+  ret = HPDF_UseUTFEncodings(pdf)
+  If ret <> #HPDF_OK
+    ProcedureReturn ret
+  EndIf
+  ProcedureReturn HPDF_SetCurrentEncoder(pdf, "UTF-8")
+EndProcedure
+
+; Frees the document's contents (native HPDF_FreeDoc) and purges the caches.
+; The doc allocation itself survives; call HaruResetDoc() before reusing it.
+Procedure HaruFreeDoc(pdf.i)
+  HaruPurgeDocCaches(pdf)
+  HPDF_FreeDoc(pdf)
 EndProcedure
 
 ; "err <error-code-hex>/<detail-hex>" for the doc's latched error - for FAIL
@@ -1294,11 +1708,28 @@ Procedure.i HaruPngFromFile(pdf.i, path$)
 EndProcedure
 
 ; Returns a cached ExtGState with both fill (ca) and stroke (CA) alpha set,
-; one per doc+alpha. Cache before creating: repeated HaruAlpha calls with
-; the same alpha reuse one ExtGState. Returns handle, 0 on failure.
+; one per doc+alpha. Repeated HaruAlpha calls with the same alpha reuse one
+; ExtGState. Returns the handle, 0 on failure. Validation (review R1):
+;   - NaN / +-Infinity rejected by BIT PATTERN. PB float compares are
+;     non-IEEE for NaN (probed on 6.40: nan < 0 is True, nan <> nan is
+;     False), so the exponent bits are the only reliable test - and
+;     libharu's own C range check (v < 0 || v > 1.0f) lets NaN through.
+;   - alpha outside [0, 1] rejected wrapper-side; the native range failure
+;     (HPDF_EXT_GSTATE_OUT_OF_RANGE $1080) stays reachable for diagnostics.
+;   - BOTH setter statuses are checked; the ExtGState stays document-owned
+;     on failure (no individual free) and is cached only after both succeed.
+;   - Cache key is the float's IEEE-754 bit pattern as hex - StrF() rounds
+;     to 10 decimals and is not injective.
 Procedure.i HaruAlpha(pdf.i, alpha.f)
-  Protected key$ = Str(pdf) + "|" + StrF(alpha)
-  Protected gs.i
+  Protected key$, gs.i, bits.l
+  CopyMemory(@alpha, @bits, 4)               ; raw IEEE-754 bit pattern
+  If (bits & $7F800000) = $7F800000          ; exponent all ones: NaN or +-Inf
+    ProcedureReturn 0
+  EndIf
+  If alpha < 0 Or alpha > 1.0
+    ProcedureReturn 0
+  EndIf
+  key$ = Str(pdf) + "|" + Hex(bits)
   If FindMapElement(HaruGsCache(), key$)
     ProcedureReturn HaruGsCache()
   EndIf
@@ -1306,8 +1737,12 @@ Procedure.i HaruAlpha(pdf.i, alpha.f)
   If gs = 0
     ProcedureReturn 0
   EndIf
-  HPDF_ExtGState_SetAlphaFill(gs, alpha)
-  HPDF_ExtGState_SetAlphaStroke(gs, alpha)
+  If HPDF_ExtGState_SetAlphaFill(gs, alpha) <> #HPDF_OK
+    ProcedureReturn 0
+  EndIf
+  If HPDF_ExtGState_SetAlphaStroke(gs, alpha) <> #HPDF_OK
+    ProcedureReturn 0
+  EndIf
   HaruGsCache(key$) = gs
   ProcedureReturn gs
 EndProcedure
@@ -1321,12 +1756,16 @@ EndProcedure
 ; with BeginText/EndText itself and stays a one-call API.
 Procedure.i HaruTextOut(page.i, xpos.f, ypos.f, s$)
   Protected ret.i = HPDF_Page_BeginText(page)
+  Protected fin.i
   If ret <> #HPDF_OK
     ProcedureReturn ret
   EndIf
   ret = HPDF_Page_TextOut(page, xpos, ypos, s$)
-  HPDF_Page_EndText(page) ; always close the text object; stream errors latch on the doc
-  ProcedureReturn ret
+  fin = HPDF_Page_EndText(page) ; always attempt to close the text object
+  If ret = #HPDF_OK
+    ret = fin                   ; a failed finalization is no longer masked (R3)
+  EndIf
+  ProcedureReturn ret           ; first error wins
 EndProcedure
 
 ; ---------------------------------------------------------------------------
@@ -1399,12 +1838,16 @@ EndProcedure
 ; synchronously, so freeing right after the call is safe.
 Procedure.i HaruTextOutRaw(page.i, xpos.f, ypos.f, *bytes)
   Protected ret.i = HPDF_Page_BeginText(page)
+  Protected fin.i
   If ret <> #HPDF_OK
     ProcedureReturn ret
   EndIf
   ret = HPDF_Page_TextOutRaw(page, xpos, ypos, *bytes)
-  HPDF_Page_EndText(page)
-  ProcedureReturn ret
+  fin = HPDF_Page_EndText(page) ; always attempt to close the text object
+  If ret = #HPDF_OK
+    ret = fin                   ; a failed finalization is no longer masked (R3)
+  EndIf
+  ProcedureReturn ret           ; first error wins
 EndProcedure
 
 ; ---------------------------------------------------------------------------
