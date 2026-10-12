@@ -4,7 +4,7 @@ EnableExplicit
 XIncludeFile "../hpdf_module.pbi"
 
 Procedure.i Main()
-  Protected pdf.i, page.i, font.i, gs.i, *bytes
+  Protected pdf.i, page.i, font.i, gs.i, emfile.i, *bytes
   Protected result.i = 1
   Protected pos.HPDF::HPDFPoint
   Protected rect.HPDF::HPDFRect
@@ -80,8 +80,24 @@ Procedure.i Main()
     If HPDF::HPDF_Page_CreateURILinkAnnot(page, @rect, "https://libharu.org/") = 0
       PrintN("FAIL: rectangle parameter") : Break
     EndIf
-    date\year = 2026 : date\month = 1 : date\day = 1 : date\ind = Asc("+")
-    HPDF::HPDF_SetInfoDateAttr(pdf, HPDF::#HPDF_INFO_CREATION_DATE, @date)
+    ; Exercise all three by-value date exports with nonzero time/offsets.
+    date\year = 2026 : date\month = 1 : date\day = 2
+    date\hour = 17 : date\minutes = 10 : date\seconds = 30
+    date\ind = Asc("+") : date\off_hour = 1 : date\off_minutes = 30
+    If HPDF::HPDF_SetInfoDateAttr(pdf, HPDF::#HPDF_INFO_CREATION_DATE, @date) <> HPDF::#HPDF_OK
+      PrintN("FAIL: document date " + HPDF::HaruErrorText(pdf)) : Break
+    EndIf
+    emfile = HPDF::HPDF_AttachFile(pdf, "pdf_a/factur-x.xml")
+    If emfile = 0
+      PrintN("FAIL: embedded file " + HPDF::HaruErrorText(pdf)) : Break
+    EndIf
+    If HPDF::HPDF_EmbeddedFile_SetCreationDate(emfile, @date) <> HPDF::#HPDF_OK
+      PrintN("FAIL: embedded creation date " + HPDF::HaruErrorText(pdf)) : Break
+    EndIf
+    date\day = 3 : date\ind = Asc("-") : date\off_hour = 2 : date\off_minutes = 15
+    If HPDF::HPDF_EmbeddedFile_SetLastModificationDate(emfile, @date) <> HPDF::#HPDF_OK
+      PrintN("FAIL: embedded modification date " + HPDF::HaruErrorText(pdf)) : Break
+    EndIf
     HPDF::HPDF_SetInfoAttr(pdf, HPDF::#HPDF_INFO_TITLE, "HPDF module smoke test")
     If HPDF::HPDF_GetError(pdf) <> HPDF::#HPDF_OK
       PrintN("FAIL drawing/metadata: " + HPDF::HaruErrorText(pdf)) : Break

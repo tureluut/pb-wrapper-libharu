@@ -33,16 +33,26 @@
 ;     first, or pass the DLL directory to HaruInit(dir$). Without them
 ;     HaruInit() fails cleanly (no crash).
 ;   - Linux port : OpenLibrary/GetFunction/Prototypes
-;     are cross-platform, so the prototype binding is untouched. Only the
-;     load logic inside HaruInit() branches per OS (details there): dlopen
-;     has NO exe-directory search (resolved via ProgramFilename()), cwd
-;     needs the './' prefix, and 'libhpdf.so.2' candidates cover distro
-;     runtime packages that ship only the versioned soname. zlib/libpng are
-;     ld.so-resolved (system packages) or statically baked into libhpdf.so,
-;     so the Windows dependency-preload is Windows-only. Strings need NO
-;     changes: PB is UCS-2 internally on every OS, so p-ascii/p-utf8 param
-;     conversion behaves identically, and #PB_Ascii PeekS on the (7-bit
-;     ASCII) version / font-name returns is exact on Linux too.
+;     are cross-platform, so the prototype binding is mostly untouched. Two
+;     things branch per OS:
+;     a) loading - dlopen has NO exe-directory search (resolved via
+;     ProgramFilename()), cwd needs the './' prefix, and 'libhpdf.so.2'
+;     candidates cover distro runtime packages that ship only the versioned
+;     soname. zlib/libpng are ld.so-resolved (system packages) or statically
+;     baked into libhpdf.so, so the Windows dependency-preload is Windows-
+;     only. Strings need NO changes: PB is UCS-2 internally on every OS, so
+;     p-ascii/p-utf8 param conversion behaves identically, and #PB_Ascii
+;     PeekS on the (7-bit ASCII) version / font-name returns is exact on
+;     Linux too.
+;     b) SysV struct ABI - libharu takes HPDF_Rect/HPDF_Date/HPDF_Point BY
+;     VALUE in six of the bound exports (see the HaruShim_* block). Win64
+;     passes struct args by hidden pointer, so pointer prototypes were
+;     ABI-correct there by accident; SysV x86-64 passes all-float structs in
+;     XMM registers instead and shifts following arguments down, which
+;     corrupts every annotation/date call. On Linux the six public names are
+;     pointed at HaruShim_* procedures that repack the struct bytes into
+;     scalars landing in the exact registers/stack slots SysV mandates.
+;     Sample code is OS-agnostic (always passes @rect / @date).
 ;
 ; USAGE CONTRACT: call HaruInit() once, before any HPDF_* / Haru* call.
 ; Every HPDF_* name below is a global function POINTER (prototype-typed);
@@ -267,8 +277,9 @@ DeclareModule HPDF
   EndStructure
 
   ; hpdf_types.h _HPDF_Rect field order (left, bottom, right, top). AlignC:
-  ; Win64 passes 16-byte C struct BY-VALUE args as a pointer to a caller copy,
-  ; so annotation calls take @rect (HPDFRect) - layout has no padding either
+  ; annotation calls take @rect (HPDFRect) on every OS - Win64 because struct
+  ; args travel by hidden pointer, Linux because the HaruShim_* block unpacks
+  ; the pointer into the SysV by-value registers. Layout has no padding either
   ; way, AlignC only pins it against future edits.
   Structure HPDFRect Align #PB_Structure_AlignC
     left.f
@@ -473,6 +484,12 @@ DeclareModule HPDF
   Prototype.l Proto_HPDF_Page_ExecuteXObject(page.i, obj.i)          ; Do (transform via Concat + GSave/GRestore)
 
   ; --- annotations (HPDF_Rect/HPDF_Date structs >8 bytes pass BY REF on Win64) --
+  ; The prototypes below take the struct as a POINTER. That is the exact Win64
+  ; ABI for a by-value C struct (hidden pointer). On SysV x86-64 (Linux) the
+  ; by-value HPDF_Rect travels in XMM0/XMM1 instead - these exports are re-
+  ; bound there through HaruShim_* procedures + the ProtoLnx_* packed
+  ; prototypes declared in the "SysV ABI" block; call sites stay pointer-based
+  ; on every OS.
   Prototype.i Proto_HPDF_Page_CreateLinkAnnot(page.i, *rect, dst.i)          ; HPDF_Rect by ref
   Prototype.i Proto_HPDF_Page_CreateURILinkAnnot(page.i, *rect, uri.p-ascii) ; HPDF_Rect by ref
   Prototype.i Proto_HPDF_Page_CreateTextAnnotRaw(page.i, *rect, *text, encoder.i) ; = CreateTextAnnot; raw contents; encoder 0 = NULL
@@ -495,12 +512,12 @@ DeclareModule HPDF
   Prototype.l Proto_HPDF_EmbeddedFile_SetSubtype(emfile.i, subtype.p-ascii)
   Prototype.l Proto_HPDF_EmbeddedFile_SetAFRelationship(emfile.i, relationship.l)
   Prototype.l Proto_HPDF_EmbeddedFile_SetSize(emfile.i, size.q)      ; HPDF_UINT64 -> .q
-  Prototype.l Proto_HPDF_EmbeddedFile_SetCreationDate(emfile.i, *date)          ; HPDF_Date by ref
-  Prototype.l Proto_HPDF_EmbeddedFile_SetLastModificationDate(emfile.i, *date)  ; HPDF_Date by ref
+  Prototype.l Proto_HPDF_EmbeddedFile_SetCreationDate(emfile.i, *date)          ; HPDF_Date by ref (SysV: see HaruShim_ block)
+  Prototype.l Proto_HPDF_EmbeddedFile_SetLastModificationDate(emfile.i, *date)  ; HPDF_Date by ref (SysV: see HaruShim_ block)
   Prototype.l Proto_HPDF_SetPassword(pdf.i, owner_passwd.p-ascii, user_passwd.p-ascii)
   Prototype.l Proto_HPDF_SetPermission(pdf.i, permission.l)          ; HPDF_ENABLE_* flags
   Prototype.l Proto_HPDF_SetEncryptionMode(pdf.i, mode.l, key_len.l) ; HPDF_ENCRYPT_R2/R3
-  Prototype.l Proto_HPDF_SetInfoDateAttr(pdf.i, infoType.l, *date)   ; "type" renamed (PB keyword); HPDF_Date by ref
+  Prototype.l Proto_HPDF_SetInfoDateAttr(pdf.i, infoType.l, *date)   ; "type" renamed (PB keyword); HPDF_Date by ref (SysV: see HaruShim_ block)
   Prototype.l Proto_HPDF_SetPDFAConformance(pdf.i, pdfa_type.l)      ; HPDF_PDFAType
   Prototype.l Proto_HPDF_AddPDFAXmpExtension(pdf.i, xmp_description.p-ascii)
   Prototype.l Proto_HPDF_AppendOutputIntents(pdf.i, iccname.p-ascii, iccdict.i)  ; iccdict = HPDF_OutputIntent
@@ -755,6 +772,129 @@ Module HPDF
   Global HaruDepZlib.i = 0
   Global HaruDepPng.i  = 0
 
+  ; ----------------------------------------------------------------------------
+  ; Linux SysV x86-64: by-value struct parameters (annotation rects, dates).
+  ;
+  ; libharu 2.4.6 declares these six exports with C struct BY-VALUE params:
+  ;   HPDF_Page_CreateLinkAnnot(page, HPDF_Rect, HPDF_Page)
+  ;   HPDF_Page_CreateURILinkAnnot(page, HPDF_Rect, const char* uri)
+  ;   HPDF_Page_CreateTextAnnot(page, HPDF_Rect, const char*, HPDF_Encoder)
+  ;   HPDF_EmbeddedFile_SetCreationDate(emfile, HPDF_Date)
+  ;   HPDF_EmbeddedFile_SetLastModificationDate(emfile, HPDF_Date)
+  ;   HPDF_SetInfoDateAttr(pdf, HPDF_InfoType, HPDF_Date)
+  ;
+  ; PureBasic cannot express struct-by-value parameters (prototypes AND
+  ; procedures reject them). Win64 passes struct args via a hidden pointer,
+  ; so the pointer prototypes above happen to BE the ABI - correct by
+  ; accident. SysV x86-64 classifies instead: an HPDF_Rect (16 B, two all-
+  ; float eightbytes) travels in XMM0+XMM1 and every following argument
+  ; shifts one general-purpose register down - the pointer prototype hands
+  ; libharu the RECT POINTER where it reads the uri/text string, i.e. the
+  ; first byte of rect\left (50.0f = 00 00 24 42) ends the "string" at once
+  ; (HPDF_INVALID_URI). An HPDF_Date (36 B) travels IN MEMORY in this libharu
+  ; build (verified by objdump: both date setters read the struct from the
+  ; stack slots right after the return address; SetCreationDate tail-jumps
+  ; into Info_SetInfoDateAttr keeping that layout) - a pointer prototype
+  ; makes libharu read a pointer value as "year".
+  ;
+  ; Fix: on this OS the six public names are NOT bound to GetFunction
+  ; directly; HaruInit() points them at the HaruShim_* procedures below.
+  ; The shims have the same pointer signature as everywhere else (sample
+  ; code stays OS-agnostic), copy the struct bytes into scalars, and call
+  ; the packed prototypes. Layout calibrated against the shipped libhpdf.so
+  ; (objdump) and gcc 15.2 / Ubuntu 26.04 (by-value aggregates of this size
+  ; are passed in memory on this platform, not in the SysV register file):
+  ;   HPDF_Rect -> two 8-byte chunks as .d args   -> XMM0, XMM1
+  ;   HPDF_Date -> dead .l args eat the remaining GP register slots, then
+  ;               five 8-byte chunks as .q args land on the stack at
+  ;               0/8/16/24/32 - exactly where libharu reads its spilled
+  ;               by-value HPDF_Date (five dead args after emfile, four
+  ;               after pdf + infoType, filling all six GP registers)
+  ; HPDF_Point (LineAnnot_SetPosition) is not bound by this wrapper; if it
+  ; ever is, pack its 8 bytes into ONE .d arg (single XMM register).
+  ; ----------------------------------------------------------------------------
+  CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+    Prototype.i ProtoLnx_HPDF_Page_CreateLinkAnnot(page.i, rect_lo.d, rect_hi.d, dst.i)
+    Prototype.i ProtoLnx_HPDF_Page_CreateURILinkAnnot(page.i, rect_lo.d, rect_hi.d, uri.i)
+    Prototype.i ProtoLnx_HPDF_Page_CreateTextAnnotRaw(page.i, rect_lo.d, rect_hi.d, *text, encoder.i)
+    Prototype.l ProtoLnx_HPDF_EmbeddedFile_SetDate(emfile.i, dead1.l, dead2.l, dead3.l, dead4.l, dead5.l, chunk1.q, chunk2.q, chunk3.q, chunk4.q, chunk5.q)
+    Prototype.l ProtoLnx_HPDF_SetInfoDateAttr(pdf.i, infoType.l, dead1.l, dead2.l, dead3.l, dead4.l, chunk1.q, chunk2.q, chunk3.q, chunk4.q, chunk5.q)
+
+    Global HaruLnx_Page_CreateLinkAnnot.ProtoLnx_HPDF_Page_CreateLinkAnnot
+    Global HaruLnx_Page_CreateURILinkAnnot.ProtoLnx_HPDF_Page_CreateURILinkAnnot
+    Global HaruLnx_Page_CreateTextAnnotRaw.ProtoLnx_HPDF_Page_CreateTextAnnotRaw
+    Global HaruLnx_EmbeddedFile_SetCreationDate.ProtoLnx_HPDF_EmbeddedFile_SetDate
+    Global HaruLnx_EmbeddedFile_SetLastModificationDate.ProtoLnx_HPDF_EmbeddedFile_SetDate
+    Global HaruLnx_SetInfoDateAttr.ProtoLnx_HPDF_SetInfoDateAttr
+
+    ; HPDF_Rect: two 8-byte chunks -> XMM0/XMM1. *rect must be a valid
+    ; HPDFRect (no NULL check - Win64 would crash in the callee all the same).
+    Procedure.i HaruShim_Page_CreateLinkAnnot(page.i, *rect, dst.i)
+      Protected rect_lo.d, rect_hi.d
+      CopyMemory(*rect, @rect_lo, 8)
+      CopyMemory(*rect + 8, @rect_hi, 8)
+      ProcedureReturn HaruLnx_Page_CreateLinkAnnot(page, rect_lo, rect_hi, dst)
+    EndProcedure
+
+    ; *uri arrives already converted to a char* (the public prototype's
+    ; p-ascii param did that caller-side); pass the pointer through untouched.
+    Procedure.i HaruShim_Page_CreateURILinkAnnot(page.i, *rect, *uri)
+      Protected rect_lo.d, rect_hi.d
+      CopyMemory(*rect, @rect_lo, 8)
+      CopyMemory(*rect + 8, @rect_hi, 8)
+      ProcedureReturn HaruLnx_Page_CreateURILinkAnnot(page, rect_lo, rect_hi, *uri)
+    EndProcedure
+
+    Procedure.i HaruShim_Page_CreateTextAnnotRaw(page.i, *rect, *text, encoder.i)
+      Protected rect_lo.d, rect_hi.d
+      CopyMemory(*rect, @rect_lo, 8)
+      CopyMemory(*rect + 8, @rect_hi, 8)
+      ProcedureReturn HaruLnx_Page_CreateTextAnnotRaw(page, rect_lo, rect_hi, *text, encoder)
+    EndProcedure
+
+    ; HPDF_Date: C layout year/month/day/hour/minutes/seconds (l), ind (a,
+    ; offset 24), off_hour (l, offset 28), off_min (l, offset 32) = 36 bytes.
+    ; Packed little-endian into 8-byte chunks (64-bit temps force .q shifts).
+    ; dead1..dead5 eat RSI..R9 (the callee never reads them); the five date
+    ; chunks land on the stack at 0/8/16/24/32 - this libharu reads the whole
+    ; by-value date from there.
+    Procedure.l HaruShim_EmbeddedFile_SetCreationDate(emfile.i, *date)
+      Protected d.HPDFDate, t.q, c1.q, c2.q, c3.q, c4.q, c5.q
+      CopyMemory(*date, @d, SizeOf(HPDFDate))
+      t = d\month : c1 = d\year | (t << 32)
+      t = d\hour : c2 = d\day | (t << 32)
+      t = d\seconds : c3 = d\minutes | (t << 32)
+      t = d\off_hour : c4 = d\ind | (t << 32)
+      c5 = d\off_minutes
+      ProcedureReturn HaruLnx_EmbeddedFile_SetCreationDate(emfile, 0, 0, 0, 0, 0, c1, c2, c3, c4, c5)
+    EndProcedure
+
+    Procedure.l HaruShim_EmbeddedFile_SetLastModificationDate(emfile.i, *date)
+      Protected d.HPDFDate, t.q, c1.q, c2.q, c3.q, c4.q, c5.q
+      CopyMemory(*date, @d, SizeOf(HPDFDate))
+      t = d\month : c1 = d\year | (t << 32)
+      t = d\hour : c2 = d\day | (t << 32)
+      t = d\seconds : c3 = d\minutes | (t << 32)
+      t = d\off_hour : c4 = d\ind | (t << 32)
+      c5 = d\off_minutes
+      ProcedureReturn HaruLnx_EmbeddedFile_SetLastModificationDate(emfile, 0, 0, 0, 0, 0, c1, c2, c3, c4, c5)
+    EndProcedure
+
+    Procedure.l HaruShim_SetInfoDateAttr(pdf.i, infoType.l, *date)
+      Protected d.HPDFDate, t.q, c1.q, c2.q, c3.q, c4.q, c5.q
+      CopyMemory(*date, @d, SizeOf(HPDFDate))
+      t = d\month : c1 = d\year | (t << 32)
+      t = d\hour : c2 = d\day | (t << 32)
+      t = d\seconds : c3 = d\minutes | (t << 32)
+      t = d\off_hour : c4 = d\ind | (t << 32)
+      c5 = d\off_minutes
+      ; dead1..dead4 eat RDX..R9 (the callee never reads them); the five date
+      ; chunks land on the stack at offsets 0/8/16/24/32 - exactly where
+      ; libharu reads its spilled by-value HPDF_Date.
+      ProcedureReturn HaruLnx_SetInfoDateAttr(pdf, infoType, 0, 0, 0, 0, c1, c2, c3, c4, c5)
+    EndProcedure
+  CompilerEndIf
+
   ; Loads the libharu shared library and binds the full export set. Returns 1
   ; on success. On failure (library or a dependency missing, or an export not
   ; found - i.e. a wrong library version), returns 0; HaruMissing$ / HaruBound
@@ -991,9 +1131,20 @@ Module HPDF
     HaruBind(HPDF_Image_GetColorSpace, "HPDF_Image_GetColorSpace")
     HaruBind(HPDF_Page_ExecuteXObject, "HPDF_Page_ExecuteXObject")
 
-    HaruBind(HPDF_Page_CreateLinkAnnot, "HPDF_Page_CreateLinkAnnot")
-    HaruBind(HPDF_Page_CreateURILinkAnnot, "HPDF_Page_CreateURILinkAnnot")
-    HaruBind(HPDF_Page_CreateTextAnnotRaw, "HPDF_Page_CreateTextAnnot") ; same export, raw contents
+    CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+      ; by-value struct exports: bind the packed prototypes, then point the
+      ; public names at the shims (same pointer signature as on Windows)
+      HaruBind(HaruLnx_Page_CreateLinkAnnot, "HPDF_Page_CreateLinkAnnot")
+      HPDF_Page_CreateLinkAnnot = @HaruShim_Page_CreateLinkAnnot()
+      HaruBind(HaruLnx_Page_CreateURILinkAnnot, "HPDF_Page_CreateURILinkAnnot")
+      HPDF_Page_CreateURILinkAnnot = @HaruShim_Page_CreateURILinkAnnot()
+      HaruBind(HaruLnx_Page_CreateTextAnnotRaw, "HPDF_Page_CreateTextAnnot") ; same export, raw contents
+      HPDF_Page_CreateTextAnnotRaw = @HaruShim_Page_CreateTextAnnotRaw()
+    CompilerElse
+      HaruBind(HPDF_Page_CreateLinkAnnot, "HPDF_Page_CreateLinkAnnot")
+      HaruBind(HPDF_Page_CreateURILinkAnnot, "HPDF_Page_CreateURILinkAnnot")
+      HaruBind(HPDF_Page_CreateTextAnnotRaw, "HPDF_Page_CreateTextAnnot") ; same export, raw contents
+    CompilerEndIf
     HaruBind(HPDF_LinkAnnot_SetHighlightMode, "HPDF_LinkAnnot_SetHighlightMode")
     HaruBind(HPDF_LinkAnnot_SetBorderStyle, "HPDF_LinkAnnot_SetBorderStyle")
     HaruBind(HPDF_TextAnnot_SetIcon, "HPDF_TextAnnot_SetIcon")
@@ -1010,12 +1161,24 @@ Module HPDF
     HaruBind(HPDF_EmbeddedFile_SetSubtype, "HPDF_EmbeddedFile_SetSubtype")
     HaruBind(HPDF_EmbeddedFile_SetAFRelationship, "HPDF_EmbeddedFile_SetAFRelationship")
     HaruBind(HPDF_EmbeddedFile_SetSize, "HPDF_EmbeddedFile_SetSize")
-    HaruBind(HPDF_EmbeddedFile_SetCreationDate, "HPDF_EmbeddedFile_SetCreationDate")
-    HaruBind(HPDF_EmbeddedFile_SetLastModificationDate, "HPDF_EmbeddedFile_SetLastModificationDate")
+    CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+      HaruBind(HaruLnx_EmbeddedFile_SetCreationDate, "HPDF_EmbeddedFile_SetCreationDate")
+      HPDF_EmbeddedFile_SetCreationDate = @HaruShim_EmbeddedFile_SetCreationDate()
+      HaruBind(HaruLnx_EmbeddedFile_SetLastModificationDate, "HPDF_EmbeddedFile_SetLastModificationDate")
+      HPDF_EmbeddedFile_SetLastModificationDate = @HaruShim_EmbeddedFile_SetLastModificationDate()
+    CompilerElse
+      HaruBind(HPDF_EmbeddedFile_SetCreationDate, "HPDF_EmbeddedFile_SetCreationDate")
+      HaruBind(HPDF_EmbeddedFile_SetLastModificationDate, "HPDF_EmbeddedFile_SetLastModificationDate")
+    CompilerEndIf
     HaruBind(HPDF_SetPassword, "HPDF_SetPassword")
     HaruBind(HPDF_SetPermission, "HPDF_SetPermission")
     HaruBind(HPDF_SetEncryptionMode, "HPDF_SetEncryptionMode")
-    HaruBind(HPDF_SetInfoDateAttr, "HPDF_SetInfoDateAttr")
+    CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+      HaruBind(HaruLnx_SetInfoDateAttr, "HPDF_SetInfoDateAttr")
+      HPDF_SetInfoDateAttr = @HaruShim_SetInfoDateAttr()
+    CompilerElse
+      HaruBind(HPDF_SetInfoDateAttr, "HPDF_SetInfoDateAttr")
+    CompilerEndIf
     HaruBind(HPDF_SetPDFAConformance, "HPDF_SetPDFAConformance")
     HaruBind(HPDF_AddPDFAXmpExtension, "HPDF_AddPDFAXmpExtension")
     HaruBind(HPDF_AppendOutputIntents, "HPDF_AppendOutputIntents")

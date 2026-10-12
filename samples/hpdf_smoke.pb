@@ -3,7 +3,8 @@
 ; ----------------------------------------------------------------------------
 ; Exercises the full render surface that motivated libharu: embedded TTF with
 ; UTF-8 text, RGB fill, custom dash, alpha watermark (ExtGState), rotated
-; text (transform matrix), runtime-generated PNG image.
+; text (transform matrix), PNG image (bundled on Linux, runtime-generated
+; with the PB Image library on Windows).
 ;
 ; ----------------------------------------------------------------------------
 
@@ -70,12 +71,9 @@ PrintN("PASS page (A4 portrait)")
 ; --- block: embedded TTF font ---------------------------------------------------
 ; Fail fast on a stripped box: no silent fallback to core Helvetica - the
 ; UTF-8 assertion depends on the embedded TTF.
-; No C:\Windows\Fonts on Linux: use the metric-compatible Liberation Sans
-; (Debian/Ubuntu layout below - adjust for your distro, or ship the TTF next
-; to the binary and point at it; Liberation Sans is the Arial drop-in, and
-; it IS freely redistributable, unlike Arial itself).
+; Linux uses the bundled font so no desktop/system font package is needed.
 CompilerIf #PB_Compiler_OS = #PB_OS_Linux
-  Define arial$ = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
+  Define arial$ = "ttfont/PenguinAttack.ttf"
 CompilerElse
   Define arial$ = "C:/Windows/Fonts/arial.ttf"
 CompilerEndIf
@@ -90,7 +88,7 @@ If font = 0
   HaruFree(pdf)
   End 1
 EndIf
-PrintN("PASS font (embedded TTF arial.ttf, UTF-8 encoding)")
+PrintN("PASS font (embedded TTF " + arial$ + ", UTF-8 encoding)")
 
 ; --- block: UTF-8 text (non-ASCII proves the UTF-8 pipeline) ---------------------
 If HPDF_Page_SetFontAndSize(page, font, 24) <> #HPDF_OK
@@ -171,7 +169,12 @@ EndIf
 HPDF_Page_GRestore(page)
 PrintN("PASS rotation (45 deg matrix)")
 
-; --- block: PNG image, generated at runtime with the PB 2D lib ----------------------
+; --- block: PNG image -------------------------------------------------------------
+; PB's Linux Image library pulls GTK symbols that console builds do not link.
+; Use a bundled PNG instead so this test also works headlessly under WSL.
+CompilerIf #PB_Compiler_OS = #PB_OS_Linux
+  Define png$ = "pngsuite/basn2c08.png"
+CompilerElse
 UsePNGImageEncoder()
 Define img.i = CreateImage(#PB_Any, 160, 90)
 If img = 0
@@ -191,6 +194,7 @@ If SaveImage(img, png$, #PB_ImagePlugin_PNG) = 0
   End 1
 EndIf
 FreeImage(img)
+CompilerEndIf
 Define himg.i = HaruPngFromFile(pdf, png$)
 If himg = 0
   PrintN("FAIL image (HaruPngFromFile) " + HaruErrorText(pdf))
@@ -202,7 +206,7 @@ If HPDF_Page_DrawImage(page, himg, 300, 620, 160, 90) <> #HPDF_OK
   HaruFree(pdf)
   End 1
 EndIf
-PrintN("PASS image (runtime PNG " + Str(HPDF_Image_GetWidth(himg)) + "x" + Str(HPDF_Image_GetHeight(himg)) + ")")
+PrintN("PASS image (PNG " + Str(HPDF_Image_GetWidth(himg)) + "x" + Str(HPDF_Image_GetHeight(himg)) + ")")
 
 ; --- block: save -------------------------------------------------------------------
 If HPDF_GetError(pdf) <> #HPDF_OK

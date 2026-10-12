@@ -10,9 +10,12 @@ needed**.
   [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) (libharu, zlib, libpng —
   all permit free commercial use and redistribution).
 - **Requirements:** PureBasic **6.40 or higher**.
-- **Current setup:** Windows 64-bit. The wrapper itself is architecture- and
-  OS-agnostic (runtime binding), but only the x64 Windows DLLs are exercised
-  by the current test setup.
+- **Verified platforms:** Windows x64 and WSL2 Ubuntu 26.04.1 / Linux x64
+  (PureBasic 6.41 C backend, gcc 15.2). Linux uses SysV ABI shims for
+  by-value rectangle/date arguments; those shims are x64-specific — the
+  wrapper is **not** verified with a 32-bit PB compiler. A 32-bit
+  `libhpdf.so` is provided and verified at C-ABI level (see
+  `libraries/linux/x86/` and `WSL-VERIFICATION.md`).
 
 ## Files
 
@@ -24,8 +27,11 @@ needed**.
 | `samples/hpdf_module_smoke.pb` | Namespaced module smoke test using bundled assets; writes `hpdf_module_smoke.pdf` |
 | `libraries/windows/x64/`   | `hpdf.dll` + `zlib.dll` + `libpng16.dll`, 64-bit — the current, tested setup                                                         |
 | `libraries/windows/x86/`   | The same DLL set, 32-bit builds (provided for x86 targets; not covered by the current test setup)                                    |
+| `libraries/linux/x64/`     | `libhpdf.so` 2.4.6 + versioned copies; verified in WSL Ubuntu with system libpng/zlib dependencies |
+| `libraries/linux/x86/`     | `libhpdf.so` 2.4.6 **32-bit** + versioned copies; self-contained (zlib/libpng linked in statically with hidden symbols), needs only glibc at runtime. Built and C-smoke-tested in WSL; not yet usable from the wrapper's x64-only Linux shims |
+| `WSL-VERIFICATION.md`      | Linux environment, results, ABI fixes and verification scope |
 | `samples/grid_sheet.pbi`   | Shared include ported from `grid_sheet.c` (reference grid) — used by the samples that link the C file                               |
-| `samples/run_all.sh`       | Runner: compiles + runs every port from `samples/`, per-sample PASS/FAIL (exit code + output file exists); skips the two asset-dependent samples |
+| `samples/run_all.sh`       | Runner: compiles + runs every port from `samples/`, per-sample PASS/FAIL; compiles but skips execution of the two asset-dependent samples |
 | `PORTING_PLAN.md`          | Port plan: inventory, phases, conventions, risk register                                                                             |
 | `THIRD-PARTY-NOTICES.md`   | License texts of the shipped DLLs and the sample sources                                                                             |
 | `samples/*.pb`             | The sample programs — legacy samples and the C ports, see **Sample ports** below                                                     |
@@ -50,9 +56,50 @@ MSYS2_ARG_CONV_EXCL='*' "$PBC" /CONSOLE /THREAD /EXE arc_demo.exe arc_demo.pb
 ./arc_demo.exe
 ```
 
-Two samples are **asset-dependent** (like their C originals) and are skipped
-by the runner: `chfont_demo` (two user TTC files) and `ttfont_demo_jp` (a
+Two samples are **asset-dependent** (like their C originals); the runner
+compiles them but skips execution: `chfont_demo` (two user TTC files) and `ttfont_demo_jp` (a
 user TTF/TTC).
+
+### Linux / WSL
+
+Verified result: **27 PASS, 0 FAIL, 2 SKIP**. All 29 sample programs compile;
+only the two user-font-dependent programs skip execution. See
+[WSL-VERIFICATION.md](WSL-VERIFICATION.md) for the verification scope.
+
+Install PureBasic's Linux x64 C backend and gcc, plus the runtime dependencies
+`libpng16.so.16` and `libz.so.1` (Ubuntu: `libpng16-16t64`, `zlib1g`). Then:
+
+```bash
+# Run inside WSL/Linux, from the checkout:
+export PUREBASIC_HOME="$HOME/Apps/purebasic-v641"  # adjust to your installation
+cd samples
+./run_all.sh
+
+# Or compile/run one sample (assets are relative to samples/):
+"$PUREBASIC_HOME/compilers/pbcompilerc" -cl -t -o bin/arc_demo arc_demo.pb
+./bin/arc_demo
+```
+
+`PUREBASIC_HOME` is needed by the C backend to locate its support files. The
+runner sets it from the selected compiler and searches common installation
+paths if it is not already set. Executables and compile/run logs go into
+`samples/bin/`; old binaries are removed before compilation because some PB
+compiler failures return exit code zero.
+
+The samples try the system libharu or `../libraries/linux/x64/`. For an
+explicit bundled-library load, use `HaruInit("../libraries/linux/x64/")` from
+`samples/` (`HPDF::HaruInit` for the module). No `.so` rebuild is needed.
+`hpdf_smoke` uses the bundled TTF and PNG on Linux, avoiding system-font
+requirements and PB's Image-library GTK dependency in console builds; the
+Windows branch still generates its PNG at runtime. No display is required.
+
+From Windows git-bash, prevent path conversion when invoking WSL:
+
+```bash
+MSYS2_ARG_CONV_EXCL='*' wsl -d Ubuntu -- bash -c 'cd /mnt/c/docs/DONE/pb-wrapper-libharu/samples && ./run_all.sh'
+```
+
+Adjust the checkout path for your machine.
 
 ### C ports (23)
 
@@ -238,8 +285,13 @@ header:
 
 ## Distribution
 
-Ship next to your exe: the DLL set for your architecture from
-`libraries/windows/` (`x64` or `x86`) plus `THIRD-PARTY-NOTICES.md`. The
-licenses permit commercial redistribution. The wrapper (`hpdf.pbi`) and the
+On Windows, ship next to your exe the DLL set for your architecture from
+`libraries/windows/` (`x64` or `x86`) plus `THIRD-PARTY-NOTICES.md`. On Linux
+x64, ship the shared library from `libraries/linux/x64/` in a directory passed
+to `HaruInit`, or install libharu into the loader search path; provide the
+system libpng/zlib dependencies too. For 32-bit Linux targets ship
+`libraries/linux/x86/` — it needs no libpng/zlib packages, only glibc.
+Note the wrapper's Linux shims currently assume the x64 ABI (see
+[WSL-VERIFICATION.md](WSL-VERIFICATION.md)). The licenses permit commercial redistribution. The wrapper (`hpdf.pbi`) and the
 samples are build-time artifacts and do not need to ship with an end-user
 install.

@@ -5,5 +5,8 @@
 samples/hpdf_smoke
 samples/probe_noembed
 
+# Runner build dir (samples/run_all.sh compiles every port to samples/bin/)
+samples/bin/
+
 # Runtime output of the samples (regenerated on every run)
 samples/*.pdf

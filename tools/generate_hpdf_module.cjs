@@ -21,9 +21,13 @@ for (const declaration of diagnostics) {
   }
   implementation = implementation.replace(declaration + '\n', '');
 }
-const helpers = [...implementation.matchAll(/^Procedure(\.[a-z])? (Haru\w+\([^\n]*\))/gm)]
+const helpers = [...implementation.matchAll(/^Procedure(\.[a-z])? (Haru(?!Shim_)\w+\([^\n]*\))/gm)]
   .map(match => 'Declare' + (match[1] || '') + ' ' + match[2]);
-if (helpers.length !== (implementation.match(/^Procedure/gm) || []).length) {
+// HaruShim_* (Linux SysV by-value struct shims) stay module-private: they are
+// only referenced via @address inside HaruInit() after their definition, so
+// no Declare is needed and none must appear in DeclareModule.
+const shimCount = (implementation.match(/^Procedure(\.[a-z])? HaruShim_\w+/gm) || []).length;
+if (helpers.length !== (implementation.match(/^Procedure/gm) || []).length - shimCount) {
   throw new Error('An implementation procedure was not exported; review the generator.');
 }
 const indent = text => text.split('\n').map(line => line ? '  ' + line : '').join('\n');
